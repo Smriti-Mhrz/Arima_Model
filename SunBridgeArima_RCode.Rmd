@@ -1,0 +1,244 @@
+---
+title: "Business Forecasting — Assignment #3: ARIMA"
+subtitle: |
+  SunBridge Solar Installations: When Regression Isn't Enough
+  *Can ARIMA Outperform a Trend-Season Regression?*
+author: "LastName, FirstName | Student ID: XXXXXXX"
+
+
+
+# ── Core forecasting ecosystem ───────────────────────────────────────────────
+# fpp3 bundles: tsibble, feasts, fable, lubridate, and tidyverse helpers
+library(fpp3)
+
+## Section 1 — Load Data and Create a tsibble
+
+# The CSV uses "Mon-YY" date strings (e.g. "Jan-15").
+# lubridate::my() parses this format; yearmonth() converts it to a
+# tsibble-compatible monthly period index for time series operations.
+
+sunbridge <- read.csv("SunBridge_Installations.csv") |>
+  mutate(Month = yearmonth(my(Month))) |>
+  as_tsibble(index = Month)
+
+glimpse(sunbridge)
+summary(sunbridge$Installations)
+
+
+
+# Exploratory Data Analysis
+
+## Section 2 — Time Plot, Seasonal Plot, and ACF
+
+# ── Time plot ────────────────────────────────────────────────────────────────
+autoplot(sunbridge, Installations) +
+  labs(
+    title    = "SunBridge Solar: Monthly Installations (Jan 2015 to Dec 2024)",
+    subtitle = "Steady upward trend with pronounced summer seasonality",
+    y        = "Installations (units)",
+    x        = "Month"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", colour = "#1a3a5c"))
+
+
+
+# ── Seasonal plot: converted to tibble for clean ggplot control ───────────────
+# gg_season() inline labels overlap with 10 years; ggplot with a legend
+# is clearer and more professional for publication.
+
+sunbridge |>
+  mutate(
+    Year = factor(year(Month)),
+    Mon  = month(Month, label = TRUE, abbr = TRUE)
+  ) |>
+  as_tibble() |>
+  ggplot(aes(x = Mon, y = Installations, colour = Year, group = Year)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  scale_colour_viridis_d(option = "turbo") +
+  labs(
+    title  = "Seasonal Plot: SunBridge Installations by Month",
+    x      = "Month",
+    y      = "Installations (units)",
+    colour = "Year"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position  = "right",
+    panel.grid.minor = element_blank()
+  )
+
+# ── ACF of raw series (up to 36 lags = 3 seasonal cycles) ────────────────────
+sunbridge |>
+  ACF(Installations, lag_max = 36) |>
+  autoplot() +
+  labs(
+    title    = "ACF of Raw Monthly Installations",
+    subtitle = "Slow decay + 12-period scallops = trend AND seasonality",
+    y        = "Autocorrelation"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", colour = "#1a3a5c"))
+
+
+# Model Progression
+
+## Section 3 — Data Partitioning
+
+
+# ── Temporal train / validation split ────────────────────────────────────────
+# Training   (Jan 2015 - Dec 2022): 96 months = 8 complete calendar years
+# Validation (Jan 2023 - Dec 2024): 24 months = 2 complete calendar years
+#
+# A strict out-of-time holdout simulates real deployment: the model never
+# observes validation data during fitting. Two full validation years capture
+# two complete seasonal cycles for a robust out-of-sample accuracy estimate.
+
+train <- sunbridge |> filter(year(Month) <= 2022)   # 96 months
+valid <- sunbridge |> filter(year(Month) >= 2023)   # 24 months
+
+cat("Training set  :", nrow(train), "months — Jan 2015 to Dec 2022\n")
+cat("Validation set:", nrow(valid), "months — Jan 2023 to Dec 2024\n")
+
+
+## Section 4 — TSLM: Trend + Season Baseline
+
+
+# ── Fit TSLM ──────────────────────────────────────────────────────────────────
+# TSLM regresses Installations on:
+#   trend()   -> deterministic linear time index        (1 coefficient)
+#   season()  -> 11 monthly dummy variables             (11 coefficients)
+#                (January is the implicit baseline month)
+# Total: 1 intercept + 1 trend + 11 dummies = 13 estimated parameters
+
+fit_tslm <- train |>
+  model(TrendSeason = TSLM(Installations ~ trend() + season()))
+
+report(fit_tslm)
+
+
+
+# ── Forecast over the 24-month validation window ──────────────────────────────
+fc_tslm <- fit_tslm |> forecast(new_data = valid)
+
+fc_tslm |>
+  autoplot(sunbridge, level = NULL) +
+  labs(
+    title    = "TSLM Forecast: Trend + Season Model",
+    subtitle = "Validation period: Jan 2023 to Dec 2024",
+    y        = "Installations (units)",
+    x        = "Month"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", colour = "#1a3a5c"))
+
+# ── Validation accuracy on the held-out 24 months ────────────────────────────
+accuracy(fc_tslm, sunbridge) |>
+  select(.model, ME, RMSE, MAE, MAPE, MASE)
+
+## Section 5 — TSLM Residual Diagnostics
+
+
+# ── Three-panel residual diagnostic ───────────────────────────────────────────
+# Panel 1: Time plot of residuals — should be random scatter around zero
+# Panel 2: ACF of residuals    — bars should stay within the 95% blue bands
+# Panel 3: Histogram           — should be bell-shaped and centred at zero
+
+fit_tslm |>
+  gg_tsresiduals() +
+  ggtitle("TSLM Residual Diagnostics: Trend + Season Model")
+
+
+
+# ── Ljung-Box portmanteau test ────────────────────────────────────────────────
+# H0: residuals are white noise (no autocorrelation through lag 24)
+# H1: at least one autocorrelation through lag 24 is non-zero
+# lag = 24 is standard for monthly data (two full seasonal cycles)
+
+augment(fit_tslm) |>
+  features(.innov, ljung_box, lag = 24)
+
+## Section 6 — Fit an Automatic ARIMA Model
+
+
+# ── Step A: Fit automatic ARIMA ───────────────────────────────────────────────
+# ARIMA() in fable uses a stepwise AICc search over (p,d,q)(P,D,Q)[12]:
+#   Step 1: KPSS/ADF unit-root tests determine d and D automatically.
+#   Step 2: Stepwise grid search over p, q, P, Q minimises AICc.
+#   Step 3: The winning specification is re-estimated by Maximum Likelihood.
+
+fit_arima <- train |>
+  model(ARIMA_auto = ARIMA(Installations))
+
+# ── Step B: View selected order and estimated coefficients ────────────────────
+# Selected model: ARIMA(2,0,0)(2,1,0)[12] w/ drift
+
+report(fit_arima)
+
+
+
+
+## Section 7 — ARIMA Residual Diagnostics
+
+
+# ── Step C: Three-panel residual diagnostic for ARIMA ────────────────────────
+# Note: ggtitle updated to reflect the correct model selected by R
+fit_arima |>
+  gg_tsresiduals() +
+  ggtitle("ARIMA Residual Diagnostics: ARIMA(2,0,0)(2,1,0)[12] w/ drift")
+
+
+# ── Step D: Ljung-Box test on ARIMA residuals ─────────────────────────────────
+# Using lag = 24 for consistency with the TSLM test in Section 5
+# Target: p > 0.05 (fail to reject H0 -> residuals are white noise)
+
+augment(fit_arima) |>
+  features(.innov, ljung_box, lag = 24)
+# Actual output: lb_stat = 20.98, lb_pvalue = 0.6399
+
+
+# Comparison and Deployment Decision
+
+## Section 8 — Fit Both Models Together
+
+# ── Step E: Fit TSLM and ARIMA together in a single mable ─────────────────────
+# Fitting both in one call ensures identical training data and a consistent
+# evaluation framework; accuracy() and glance() operate uniformly across both.
+
+fit_both <- train |>
+  model(
+    TrendSeason = TSLM(Installations ~ trend() + season()),
+    ARIMA_auto  = ARIMA(Installations)
+  )
+
+# ── Step F: Forecast both models and compute validation accuracy ───────────────
+fc_both <- fit_both |> forecast(new_data = valid)
+
+accuracy(fc_both, sunbridge) |>
+  select(.model, ME, RMSE, MAE, MAPE, MASE) |>
+  arrange(MASE)
+
+# ── Step G: Overlay forecast plot ─────────────────────────────────────────────
+fc_both |>
+  autoplot(sunbridge, level = NULL) +
+  labs(
+    title    = "TSLM vs ARIMA: Forecast Comparison (Validation 2023-2024)",
+    subtitle = "Black = actuals  |  Blue = TSLM  |  Orange = ARIMA",
+    y        = "Installations (units)",
+    x        = "Month"
+  ) +
+  guides(colour = guide_legend(title = "Model")) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", colour = "#1a3a5c"))
+
+# ── Step H: AICc comparison on the training set ───────────────────────────────
+# AICc measures in-sample model quality, penalised for complexity.
+# Lower AICc = better balance between fit and parsimony on training data.
+# Note: AICc winner on training data does not guarantee best out-of-sample
+# forecast accuracy — validation accuracy is the operationally relevant measure.
+
+glance(fit_both) |>
+  select(.model, AICc) |>
+  arrange(AICc)
+
